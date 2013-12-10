@@ -1,9 +1,9 @@
 <?php
 
 /**
- * batch creation form submit
+ * Batch creation form submit.
  * @global user $user
- * @param array $form
+ *
  * @param array $form_state
  * @param array $content_models
  */
@@ -66,16 +66,63 @@ function batch_creation_form(&$form_state, $collection_pid) {
       ie. <em>myFile.xml</em> and <em>myFile.jpg</em>'),
   );
 
-  $form['submit'] = array(
-    '#type' => 'submit',
-    '#value' => t('Create Objects ')
+  $form['dsid_xml'] = array(
+    '#title' => "Datastream ID for original XML ingested",
+    '#type' => 'textfield',
+    '#size' => 64,
+    '#maxlength' => 64,
   );
 
+  $form['transform'] = array(
+    '#title' => "XML Datastream Transform",
+    '#type' => 'fieldset',
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+  );
+  $transforms[NULL] = t('Select a transform');
+  $cmf_transforms = module_invoke_all('islandora_content_model_forms_get_transforms');
+  foreach ($cmf_transforms as $key => $transform) {
+    if (file_exists($key)) {
+      $transforms[$key] = $transform;
+    }
+  }
 
-  return($form);
+  $moule_path = drupal_get_path('module', 'islandora_batch_ingest');
+  $include_path = "$moule_path/xslt";
+  $dir = opendir($include_path);
+  if ($dir !== FALSE) {
+    while (($file = readdir($dir)) !== FALSE) {
+      if (preg_match('/\.xslt?$/', $file)) {
+        $transforms["$include_path/$file"] = $file . " (islandora_batch_ingest)";
+      }
+    }
+    closedir($dir);
+  }
+
+  $form['transform']['transform_xslt'] = array(
+    '#title' => "Choose an XSLT",
+    '#type' => 'select',
+    '#options' => $transforms,
+    '#description' => t("This XSLT will be used when transforming ingested XML"),
+  );
+
+  $form['transform']['dsid_xml_transform'] = array(
+    '#title' => "Datastream ID for transformed XML",
+    '#type' => 'textfield',
+    '#size' => 64,
+    '#maxlength' => 64,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Create Objects'),
+  );
+  return ($form);
 }
 
 /**
+ * Batch form validate
+ *
  * @param array $form
  * @param array $form_state
  */
@@ -95,7 +142,7 @@ function batch_creation_form_validate($form, &$form_state) {
     $form_state['values']['file'] = $file;
   }
   else {
-    // set error
+    // Set error.
     form_set_error($field_name, 'Error uploading file.');
     return;
   }
@@ -123,10 +170,10 @@ function batch_creation_form_submit($form, &$form_state) {
   }
   mkdir($tmp_dir);
   $file = $form_state['values']['file'];
-  $fileName = $file->filepath;
+  $file_name = $file->filepath;
   $file_list = array();
-  $cmdString = "unzip -q -o -d $tmp_dir \"$fileName\"";
-  system($cmdString, $retVal);
+  $cmd_string = "unzip -q -o -d $tmp_dir \"$file_name\"";
+  system($cmd_string, $ret_val);
   $dirs = array();
   $do_not_add = array('.', '..', '__MACOSX');
   array_push($dirs, $tmp_dir);
@@ -170,9 +217,20 @@ function batch_creation_form_submit($form, &$form_state) {
     'file' => drupal_get_path('module', 'islandora_batch_ingest') . '/BatchIngest.inc',
   );
 
-
   foreach ($file_list as $label => $object_files) {
-    $batch['operations'][] = array('create_batch_objects', array($label, $content_model, $object_files, $collection_pid, $namespace, $metadata, $policy));
+    $params = array(
+      'label' => $label,
+      'content_model' => $content_model,
+      'object_files' => $object_files,
+      'collection_pid' => $collection_pid,
+      'namespace' => $namespace,
+      'metadata' => $metadata,
+      'policy' => $policy,
+      'dsid_xml' => $form_state['values']['dsid_xml'],
+      'transform_xslt' => $form_state['values']['transform_xslt'],
+      'dsid_xml_transform' => $form_state['values']['dsid_xml_transform'],
+    );
+    $batch['operations'][] = array('create_batch_objects', array($params));
   }
   $batch['operations'][] = array('recursive_directory_delete', array($tmp_dir));
   batch_set($batch);
@@ -180,20 +238,28 @@ function batch_creation_form_submit($form, &$form_state) {
 }
 
 /**
+ * Creates the fedora object and added the datastreams to it.
  *
- * @param <string> $label
- * @param <string> $content_model
- * @param <array> $object_files
- * @param <string> $collection_pid
- * @param <string> $namespace
- * @param <string> $metadata
+ * @param array $params
  */
-function create_batch_objects($label, $content_model, $object_files, $collection_pid, $namespace, $metadata, $policy) {
+function create_batch_objects($params = array()) {
   module_load_include('inc', 'fedora_repository', 'ContentModel');
   module_load_include('inc', 'fedora_repository', 'MimeClass');
   module_load_include('inc', 'fedora_repository', 'api/fedora_item');
   module_load_include('inc', 'fedora_repository', 'api/dublin_core');
   global $user;
+
+  $label = $params['label'];
+  $content_model = $params['content_model'];
+  $object_files = $params['object_files'];
+  $collection_pid = $params['collection_pid'];
+  $namespace = $params['namespace'];
+  $metadata = $params['metadata'];
+  $policy = $params['policy'];
+  $dsid_xml = $params['dsid_xml'];
+  $transform_xslt = $params['transform_xslt'];
+  $dsid_xml_transform = $params['dsid_xml_transform'];
+
   $cm = ContentModel::loadFromModel($content_model, 'ISLANDORACM');
   $allowed_mime_types = $cm->getMimetypes();
   $mime_helper = new MimeClass();
@@ -201,41 +267,58 @@ function create_batch_objects($label, $content_model, $object_files, $collection
   $owner = ($user->uid > 0) ? $user->name : 'anonymous';
 
   $item = Fedora_item::ingest_new_item($pid, 'A', $label, $owner);
+  if ($item) {
+    drupal_set_message(t("Successfully added base object $pid"), 'status');
+  }
   $item->add_relationship('hasModel', $content_model, FEDORA_MODEL_URI);
   $item->add_relationship('isMemberOfCollection', $collection_pid);
   if ($object_files['xml']) {
-    $data = file_get_contents($object_files['xml']);
-    $xml = simplexml_load_string($data);
-    $dcData = $xml->children('dc', TRUE);
-    $dcData->identifier = $pid;
-    $identifier = $xml->getName();
-    if ($identifier == 'dc') {
-      $item->modify_datastream_by_value($xml->saveXML(), 'DC', "Dublin Core", 'text/xml', 'X');
-      $mods_stream = batch_create_mods_from_dc($data);
-      $item->add_datastream_from_string($mods_stream, 'MODS', 'MODS', 'text/xml', 'X');
-    }
-    if ($identifier == 'mods') {
-      $mods_stream = $data;
-      $item->add_datastream_from_string($mods_stream, 'MODS', 'MODS', 'text/xml', 'X');
-      $data = batch_create_dc_from_mods($mods_stream);
-      $xml = simplexml_load_string($data);
-      $dcData = $xml->children('dc', TRUE);
-      $dcData->identifier = $pid;
+    try {
+      $xml = file_get_contents($object_files['xml']);
+      $dsid = ($dsid_xml ? $dsid_xml : 'XML');
+      if (islandora_batch_ingest_add_xml_datastream($item, $dsid, $xml)) {
+        drupal_set_message(t("Successfully added datastream $dsid to $pid"), 'status');
+      }
+      else {
+        drupal_set_message(t("Could not add datastream $dsid to $pid"), 'error');
+      }
 
-      $item->modify_datastream_by_value($xml->saveXML(), 'DC', "Dublin Core", 'text/xml', 'X');
+      if (file_exists($transform_xslt)) {
+        $dsid = ($dsid_xml_transform ? $dsid_xml_transform : 'TransformedXML');
+
+        $proc = new XsltProcessor();
+        $xsl = new DomDocument();
+        $xsl->load($transform_xslt);
+        $input = new DomDocument();
+        $input->loadXML(trim($xml));
+        $xsl = $proc->importStylesheet($xsl);
+        $output = $proc->transformToDoc($input);
+        $output = $output->saveXML();
+        if ($output) {
+          if (islandora_batch_ingest_add_xml_datastream($item, $dsid, $output)) {
+            drupal_set_message(t("Successfully added datastream $dsid to $pid"), 'status');
+          }
+          else {
+            drupal_set_message(t("Could not add datastream $dsid to $pid"), 'error');
+          }
+        }
+      }
+
+      if ($dc = $item->get_datastream_dissemination('DC')) {
+        $dc = simplexml_load_string($dc);
+        $titles = $dc->xpath('//dc:title');
+        if (isset($titles[0])) {
+          $item->modify_object($titles[0]);
+        }
+      }
+      $item->forget();
+    } catch (Exception $exc) {
+      drupal_set_message(t("An error occured trying to add the XML datastreams to object $pid"), 'error');
     }
 
-    $dc = new dublin_core($item);
-    $titles = $dc->dc['dc:title'];
-    $title = $titles[0];
-    $item->modify_object($title);
+
   }
-  else {
-    $dc = new dublin_core($item);
-    $dc_stream = $dc->as_xml();
-    $mods_stream = batch_create_mods_from_dc($dc_stream);
-    $item->add_datastream_from_string($mods_stream, 'MODS', 'MODS', 'text/xml', 'X');
-  }
+
   if ($policy) {
     $item->add_datastream_from_string($policy, 'POLICY');
   }
@@ -263,67 +346,22 @@ function create_batch_objects($label, $content_model, $object_files, $collection
 }
 
 /**
- * transforms mods to dc
- * @param string $mods_xml
- * @return string
+ * Added on updates an xml datastream
+ *
+ * @param Fedora_Item $item
+ * @param string $dsid
+ * @param string $xml
+ * @return mixed
  */
-function batch_create_dc_from_mods($xmlstr) {
-  $path = drupal_get_path('module', 'islandora_batch_ingest');
-  module_load_include('inc', 'fedora_repository', 'ObjectHelper');
-  module_load_include('inc', 'fedora_repository', 'CollectionClass');
-
-  if ($xmlstr == NULL || strlen($xmlstr) < 5) {
-    return " ";
+function islandora_batch_ingest_add_xml_datastream(Fedora_Item $item, $dsid = 'XML', $xml = '') {
+  $datastreams = $item->get_datastreams_list_as_array();
+  if (isset($datastreams[$dsid])) {
+    $method = 'modify_datastream_by_value';
   }
-
-  try {
-    $proc = new XsltProcessor();
-  } catch (Exception $e) {
-    drupal_set_message(t('@e', array('@e' => check_plain($e->getMessage()))), 'error');
-    return " ";
+  else {
+    $method = 'add_datastream_from_string';
   }
-
-  $xsl = new DomDocument();
-  $xsl->load($path . '/xslt/mods_to_dc.xsl');
-  $input = new DomDocument();
-  $input->loadXML(trim($xmlstr));
-  $xsl = $proc->importStylesheet($xsl);
-  $newdom = $proc->transformToDoc($input);
-  $dc_xml = $newdom->saveXML();
-
-  return $dc_xml;
-}
-
-/**
- * transforms dc to mods
- * @param string $mods_xml
- * @return string
- */
-function batch_create_mods_from_dc($xmlstr) {
-  $path = drupal_get_path('module', 'islandora_batch_ingest');
-  module_load_include('inc', 'fedora_repository', 'ObjectHelper');
-  module_load_include('inc', 'fedora_repository', 'CollectionClass');
-
-  if ($xmlstr == NULL || strlen($xmlstr) < 5) {
-    return " ";
-  }
-
-  try {
-    $proc = new XsltProcessor();
-  } catch (Exception $e) {
-    drupal_set_message(t('@e', array('@e' => check_plain($e->getMessage()))), 'error');
-    return " ";
-  }
-
-  $xsl = new DomDocument();
-  $xsl->load($path . '/xslt/dc_to_mods.xsl');
-  $input = new DomDocument();
-  $input->loadXML(trim($xmlstr));
-  $xsl = $proc->importStylesheet($xsl);
-  $newdom = $proc->transformToDoc($input);
-  $mods_xml = $newdom->saveXML();
-
-  return $mods_xml;
+  return $item->{$method}($xml, $dsid, $dsid, 'text/xml', 'X');
 }
 
 /**
